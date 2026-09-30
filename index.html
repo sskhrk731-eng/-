@@ -1,11 +1,473 @@
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-  <meta charset="UTF-8">
-  <title>学習アプリ</title>
-</head>
-<body>
-  <h1>学習アプリ</h1>
-  <p>ここから作っていきます。</p>
-</body>
-</html>
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.util.*;
+import java.util.concurrent.*;
+
+/**
+ * Study Shuffle — Java版（Java 17以上のJDK）
+ *
+ * 起動: java -Dfile.encoding=UTF-8 StudyShuffle.java
+ * ブラウザで http://localhost:8080 を開く。
+ * 別のポート: java -Dfile.encoding=UTF-8 StudyShuffle.java 8081
+ * 動作チェック: java -Dfile.encoding=UTF-8 StudyShuffle.java --self-test
+ * 停止: ターミナルで Ctrl+C
+ *
+ * ランダム出題・採点・制限時間の判定・解き直しはJavaで処理。
+ * ブラウザの画面にはHTML/CSSを使用し、秒数表示と時間切れ時の送信だけ
+ * 小さなJavaScriptで補助する。外部ライブラリやインターネット接続は不要。
+ * 学習データはメモリ内のみ。サーバー停止・セッション期限切れで消える。
+ * 初期設定はこのPC内だけで使うローカルサーバー。
+ */
+public class StudyShuffle {
+    static final String COOKIE = "study_shuffle_java";
+    static final SecureRandom RANDOM = new SecureRandom();
+    static final Map<String, Session> SESSIONS = new ConcurrentHashMap<>();
+    static final long SESSION_TTL = TimeUnit.HOURS.toNanos(2);
+    static final List<Subject> SUBJECTS = List.of(
+        new Subject("japanese", "国語", "国", "#b64a4a", "漢字・言葉"),
+        new Subject("math", "算数", "算", "#3766ba", "計算・図形"),
+        new Subject("science", "理科", "理", "#26734f", "自然・実験"),
+        new Subject("social", "社会", "社", "#986118", "地理・歴史"),
+        new Subject("english", "英語", "英", "#8251aa", "単語・表現")
+    );
+
+    record Subject(String id, String name, String symbol, String color, String topic) {}
+    record Question(String id, String subject, String topic, String text,
+                    String answer, List<String> choices, String explanation) {}
+    record Attempt(Question question, String selected, boolean correct, double seconds) {}
+    enum Stage { HOME, QUESTION, RESULTS }
+
+    static class Session {
+        final String csrf = token();
+        volatile long lastAccess = System.nanoTime();
+        Stage stage = Stage.HOME;
+        List<Question> deck = List.of();
+        final List<Attempt> answers = new ArrayList<>();
+        Set<String> previousIds = Set.of();
+        int count = 10, seconds = 30, index = 0;
+        boolean review = false;
+        long started, deadline;
+        String turn = token();
+        boolean answered() { return answers.size() > index; }
+        int correct() { return (int) answers.stream().filter(Attempt::correct).count(); }
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length > 0 && args[0].equals("--self-test")) { selfTest(); return; }
+        int port = args.length == 0 ? 8080 : Integer.parseInt(args[0]);
+        if (port < 1 || port > 65535) throw new IllegalArgumentException("ポートは1〜65535です。");
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 32);
+        ExecutorService executor = Executors.newFixedThreadPool(4);
+        server.setExecutor(executor);
+        server.createContext("/", StudyShuffle::handle);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> { server.stop(0); executor.shutdownNow(); }));
+        server.start();
+        System.out.println("Study Shuffle が起動しました。");
+        System.out.println("ブラウザで http://localhost:" + port + " を開いてください。");
+        System.out.println("停止するには Ctrl+C を押してください。");
+    }
+
+    // ----- HTTPの入り口。画面の操作は通常のフォームでJavaへ送る。 -----
+    static void handle(HttpExchange exchange) throws IOException {
+        try {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if (method.equals("GET") && path.equals("/style.css")) {
+                send(exchange, 200, "text/css; charset=UTF-8", CSS); return;
+            }
+            if (method.equals("GET") && path.equals("/timer.js")) {
+                send(exchange, 200, "text/javascript; charset=UTF-8", TIMER_JS); return;
+            }
+            if (!Set.of("/", "/start", "/answer", "/next", "/review", "/quit").contains(path)) {
+                send(exchange, 404, "text/plain; charset=UTF-8", "ページが見つかりません。"); return;
+            }
+            if (!method.equals("GET") && !method.equals("POST")) {
+                exchange.getResponseHeaders().set("Allow", "GET, POST");
+                send(exchange, 405, "text/plain; charset=UTF-8", "この操作には対応していません。"); return;
+            }
+            if (method.equals("GET") && !path.equals("/")) { redirect(exchange); return; }
+            Session s = sessionFor(exchange);
+            synchronized (s) {
+                s.lastAccess = System.nanoTime();
+                if (method.equals("POST")) {
+                    Map<String, String> form = readForm(exchange);
+                    if (!s.csrf.equals(form.get("csrf"))) {
+                        send(exchange, 403, "text/html; charset=UTF-8", page("もう一度開いてください", "<h1>画面の有効期限が切れました。</h1><p><a href='/'>ホームを開く</a></p>")); return;
+                    }
+                    try {
+                        switch (path) {
+                            case "/start" -> {
+                                int count = Integer.parseInt(form.getOrDefault("count", "10"));
+                                int seconds = Integer.parseInt(form.getOrDefault("seconds", "30"));
+                                if (s.stage != Stage.QUESTION) start(s, count, seconds);
+                            }
+                            case "/answer" -> {
+                                if (validTurn(s, form) && !s.answered()) answer(s, Integer.parseInt(form.getOrDefault("choice", "-2")), System.nanoTime());
+                            }
+                            case "/next" -> { if (validTurn(s, form) && s.answered()) next(s); }
+                            case "/review" -> { if (s.stage == Stage.RESULTS) review(s); }
+                            case "/quit" -> { s.stage = Stage.HOME; s.deck = List.of(); s.answers.clear(); s.review = false; }
+                            default -> throw new IllegalArgumentException("操作が見つかりません。");
+                        }
+                    } catch (IllegalArgumentException ex) {
+                        send(exchange, 400, "text/html; charset=UTF-8", page("入力を確認してください", "<h1>入力を確認してください。</h1><p>" + h(ex.getMessage()) + "</p><p><a href='/'>学習画面へ戻る</a></p>")); return;
+                    }
+                    redirect(exchange); return;
+                }
+                // 再読み込みしても時間がリセットされない。期限はJava側で判定する。
+                if (s.stage == Stage.QUESTION && !s.answered() && timed(s) && System.nanoTime() >= s.deadline) answer(s, -1, System.nanoTime());
+                String content = switch (s.stage) {
+                    case HOME -> home(s);
+                    case QUESTION -> question(s);
+                    case RESULTS -> results(s);
+                };
+                send(exchange, 200, "text/html; charset=UTF-8", page("Study Shuffle｜5教科をまぜて復習", content));
+            }
+        } catch (IllegalArgumentException ex) {
+            send(exchange, 400, "text/plain; charset=UTF-8", "入力の形式が正しくありません。ホームを開き直してください。");
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            send(exchange, 500, "text/plain; charset=UTF-8", "エラーが発生しました。ホームを開き直してください。");
+        } finally { exchange.close(); }
+    }
+
+    static boolean validTurn(Session s, Map<String,String> form) {
+        return s.stage == Stage.QUESTION && s.turn.equals(form.get("turn"));
+    }
+    static boolean timed(Session s) { return !s.review && s.seconds > 0; }
+
+    static Session sessionFor(HttpExchange exchange) {
+        String cookie = exchange.getRequestHeaders().getFirst("Cookie");
+        long now = System.nanoTime();
+        if (cookie != null) for (String part : cookie.split(";")) {
+            String[] pair = part.trim().split("=", 2);
+            if (pair.length == 2 && pair[0].equals(COOKIE)) {
+                Session existing = SESSIONS.get(pair[1]);
+                if (existing != null && now - existing.lastAccess < SESSION_TTL) return existing;
+            }
+        }
+        SESSIONS.entrySet().removeIf(entry -> now - entry.getValue().lastAccess > SESSION_TTL);
+        if (SESSIONS.size() >= 1000) throw new IllegalStateException("セッションが多すぎます。");
+        String id = token();
+        Session s = new Session();
+        SESSIONS.put(id, s);
+        exchange.getResponseHeaders().add("Set-Cookie", COOKIE + "=" + id + "; Path=/; HttpOnly; SameSite=Strict");
+        return s;
+    }
+
+    static Map<String,String> readForm(HttpExchange exchange) throws IOException {
+        byte[] body = exchange.getRequestBody().readNBytes(8193);
+        if (body.length > 8192) throw new IllegalArgumentException("送信内容が大きすぎます。");
+        Map<String,String> result = new HashMap<>();
+        for (String field : new String(body, StandardCharsets.UTF_8).split("&")) {
+            String[] pair = field.split("=", 2);
+            String key = URLDecoder.decode(pair[0], StandardCharsets.UTF_8);
+            String value = pair.length > 1 ? URLDecoder.decode(pair[1], StandardCharsets.UTF_8) : "";
+            if (result.putIfAbsent(key, value) != null) throw new IllegalArgumentException("同じ項目が重複しています。");
+        }
+        return result;
+    }
+
+    static void send(HttpExchange exchange, int status, String type, String body) throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        var headers = exchange.getResponseHeaders();
+        headers.set("Content-Type", type);
+        headers.set("Cache-Control", "no-store");
+        headers.set("X-Content-Type-Options", "nosniff");
+        headers.set("Referrer-Policy", "no-referrer");
+        headers.set("Content-Security-Policy", "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+        exchange.sendResponseHeaders(status, bytes.length);
+        exchange.getResponseBody().write(bytes);
+    }
+    static void redirect(HttpExchange exchange) throws IOException {
+        exchange.getResponseHeaders().set("Location", "/");
+        exchange.getResponseHeaders().set("Cache-Control", "no-store");
+        exchange.sendResponseHeaders(303, -1);
+    }
+
+    // ----- クイズの処理：ここはすべてJava。 -----
+    static void start(Session s, int count, int seconds) {
+        if ((count != 5 && count != 10) || (seconds != 0 && seconds != 30 && seconds != 60))
+            throw new IllegalArgumentException("問題数は5問か10問、制限時間はなし・30秒・60秒から選んでください。");
+        Map<String, Deque<Question>> pools = new HashMap<>();
+        for (Subject subject : SUBJECTS) {
+            List<Question> fresh = new ArrayList<>(), old = new ArrayList<>();
+            for (Question q : QUESTIONS) if (q.subject.equals(subject.id)) {
+                (s.previousIds.contains(q.id) ? old : fresh).add(q);
+            }
+            Collections.shuffle(fresh, RANDOM); Collections.shuffle(old, RANDOM);
+            fresh.addAll(old); pools.put(subject.id, new ArrayDeque<>(fresh));
+        }
+        List<Question> deck = new ArrayList<>();
+        for (int round = 0; round < count / 5; round++) {
+            List<Subject> order = new ArrayList<>(SUBJECTS);
+            Collections.shuffle(order, RANDOM);
+            if (!deck.isEmpty() && deck.get(deck.size()-1).subject.equals(order.get(0).id)) Collections.swap(order, 0, 1);
+            for (Subject subject : order) deck.add(shuffledChoices(pools.get(subject.id).removeFirst()));
+        }
+        s.previousIds = new HashSet<>();
+        deck.forEach(q -> s.previousIds.add(q.id));
+        s.count = count; s.seconds = seconds; s.review = false;
+        setDeck(s, deck);
+    }
+
+    static void setDeck(Session s, List<Question> deck) {
+        s.deck = List.copyOf(deck); s.index = 0; s.answers.clear(); s.stage = Stage.QUESTION;
+        beginQuestion(s);
+    }
+    static void beginQuestion(Session s) {
+        s.turn = token(); s.started = System.nanoTime();
+        s.deadline = s.started + TimeUnit.SECONDS.toNanos(s.seconds);
+    }
+    static Question shuffledChoices(Question q) {
+        List<String> choices = new ArrayList<>(q.choices);
+        Collections.shuffle(choices, RANDOM);
+        return new Question(q.id, q.subject, q.topic, q.text, q.answer, List.copyOf(choices), q.explanation);
+    }
+    static void answer(Session s, int choice, long now) {
+        if (choice < -1 || choice > 3) throw new IllegalArgumentException("選択肢が正しくありません。");
+        if (s.stage != Stage.QUESTION || s.answered()) return;
+        if (timed(s) && now >= s.deadline) choice = -1;
+        Question q = s.deck.get(s.index);
+        String selected = choice < 0 ? null : q.choices.get(choice);
+        double elapsed = Math.max(0, (now - s.started) / 1_000_000_000.0);
+        if (timed(s)) elapsed = Math.min(s.seconds, elapsed);
+        s.answers.add(new Attempt(q, selected, q.answer.equals(selected), elapsed));
+    }
+    static void next(Session s) {
+        if (s.stage != Stage.QUESTION || !s.answered()) return;
+        if (++s.index == s.deck.size()) s.stage = Stage.RESULTS;
+        else beginQuestion(s);
+    }
+    static void review(Session s) {
+        List<Question> missed = new ArrayList<>();
+        for (Attempt answer : s.answers) if (!answer.correct) missed.add(shuffledChoices(answer.question));
+        if (missed.isEmpty()) return;
+        Collections.shuffle(missed, RANDOM); s.review = true; setDeck(s, missed);
+    }
+
+    // ----- HTMLの生成 -----
+    static String home(Session s) {
+        StringBuilder out = new StringBuilder("<section class='intro'><div class='eyebrow'>LET'S SHUFFLE</div><h1>いろんな教科を、少しずつ。</h1><p>次は何の問題かな？ 5教科をまぜたクイズで、習ったことを思い出そう。</p></section><div class='home-grid'><section class='subject-panel'><h2 class='small-label'>今回も、5教科をシャッフル。</h2><ul class='subject-list'>");
+        for (Subject sub : SUBJECTS) out.append("<li><span class='subject-symbol' aria-hidden='true'>").append(sub.symbol).append("</span><span>").append(sub.name).append("</span><span class='topic'>").append(sub.topic).append("</span></li>");
+        out.append("</ul><p class='mix-note'><strong>答えて、確かめて、もう一度。</strong><br>まちがえた問題は、あとで解き直せるよ。</p></section>")
+           .append(form(s, "/start", "setup")).append("<h2>今日のチャレンジ</h2><fieldset><legend>何問やる？</legend><div class='segmented'>")
+           .append(radio("count",5,"5問",s.count)).append(radio("count",10,"10問",s.count))
+           .append("</div></fieldset><fieldset><legend>1問の制限時間</legend><div class='segmented'>")
+           .append(radio("seconds",0,"なし",s.seconds)).append(radio("seconds",30,"30秒",s.seconds)).append(radio("seconds",60,"60秒",s.seconds))
+           .append("</div><p class='hint'>じっくり考えたいときは「なし」で。</p></fieldset><div class='start-area'><button class='primary start-button' type='submit'>シャッフルして始める</button><p class='session-summary'>5教科ミックス・全60問から出題</p></div></form></div>")
+           .append("<div class='steps'><div><span>1</span>4択で答える</div><div><span>2</span>解説を読む</div><div><span>3</span>解き直す</div></div><details class='how-to'><summary>遊び方と問題について</summary><p>5問なら各教科1問、10問なら各教科2問をランダムな順で出題します。答えを選ぶと正解と解説が表示されます。まちがえた問題や時間切れの問題は、最後に時間制限なしで解き直せます。</p><p>小学5・6年生向けのオリジナル問題60問です。これまでの学年の復習も含みます。教科書によって学ぶ順番は異なります。結果は今回の正答数で、学力や定着度を判定するものではありません。</p><p>結果はこのブラウザのセッション中のみ保持します。「ホームに戻る」、サーバー停止、または2時間操作しなかった場合に消えます。</p></details>");
+        return out.toString();
+    }
+
+    static String question(Session s) {
+        Question q = s.deck.get(s.index); Subject sub = subject(q.subject);
+        Attempt attempt = s.answered() ? s.answers.get(s.index) : null;
+        long remaining = Math.max(0, TimeUnit.NANOSECONDS.toMillis(s.deadline-System.nanoTime()));
+        StringBuilder out = new StringBuilder("<div class='play-header'><h1>")
+            .append(s.review ? "まちがえた問題を解き直そう" : "シャッフルチャレンジ").append("</h1>")
+            .append(form(s,"/quit","inline-form")).append("<button class='text-button' type='submit'>やめる</button></form></div><div class='progress-row'><div class='progress-dots' role='progressbar' aria-label='回答した問題' aria-valuemin='0' aria-valuemax='")
+            .append(s.deck.size()).append("' aria-valuenow='").append(s.answers.size()).append("'>");
+        for (int i=0;i<s.deck.size();i++) out.append("<span class='progress-dot ").append(i<s.answers.size()?"done":i==s.index?"current":"").append("'></span>");
+        out.append("</div><span class='question-count-label'>").append(s.index+1).append(" / ").append(s.deck.size()).append(" 問</span></div><section class='question-card' aria-labelledby='question-title'><div class='question-topline'><div class='subject-tag' style='--subject:").append(sub.color).append("'>").append(sub.name).append("<span>").append(h(q.topic)).append("</span></div><div class='timer' id='timer'>");
+        if (attempt != null) out.append("回答済み");
+        else if (!timed(s)) out.append("時間制限なし");
+        else out.append("あと <strong id='seconds-left' data-remaining='").append(remaining).append("' data-limit='").append(s.seconds*1000).append("'>").append((remaining+999)/1000).append("</strong> 秒");
+        out.append("</div></div>");
+        if (attempt==null && timed(s)) out.append("<div class='timer-bar' id='timer-bar' aria-hidden='true'><div id='time-fill' style='width:").append(Math.min(100,remaining*100.0/(s.seconds*1000))).append("%'></div></div>");
+        out.append("<h2 class='question-title' id='question-title'>").append(h(q.text)).append("</h2>");
+        if (attempt==null) out.append(form(s,"/answer","answer-form"));
+        out.append("<div class='answers'>");
+        for (int i=0;i<4;i++) {
+            String choice = q.choices.get(i);
+            boolean correct = attempt!=null && choice.equals(q.answer);
+            boolean selected = attempt!=null && choice.equals(attempt.selected);
+            String cls = attempt==null?"":correct?"correct":selected?"wrong":"dim";
+            out.append("<button type='submit' class='answer ").append(cls).append("' name='choice' value='").append(i).append("'").append(attempt==null?"":" disabled").append("><span class='answer-letter' aria-hidden='true'>").append((char)('A'+i)).append("</span><span class='answer-text'>").append(h(choice)).append("</span>");
+            if (correct || selected) out.append("<span class='answer-status'>").append(correct?"正解":"選んだ答え").append("</span>");
+            out.append("</button>");
+        }
+        out.append("</div>");
+        if (attempt==null) {
+            out.append("</form><div class='question-bottom'><span>答えを一つ選ぼう</span></div>");
+            if (timed(s)) out.append("<form method='post' action='/answer' id='timeout-form' hidden>").append(hidden(s)).append("<input type='hidden' name='choice' value='-1'></form><noscript><p class='hint'>秒数の表示はJavaScriptで動きます。無効でも回答できますが、制限時間を過ぎた回答は時間切れになります。</p></noscript>");
+        } else {
+            out.append("<div class='feedback ").append(attempt.correct?"":"incorrect").append("'><h3 class='feedback-title'>").append(attempt.correct?"正解！":attempt.selected==null?"時間切れ。答えを確かめよう。":"おしい！ 解説を読んでみよう。").append("</h3>");
+            if (!attempt.correct) out.append("<p class='correct-answer'>正解：").append(h(q.answer)).append("</p>");
+            out.append("<p>").append(h(q.explanation)).append("</p></div>").append(form(s,"/next","feedback-actions")).append("<button class='primary' type='submit'>").append(s.index+1==s.deck.size()?"結果を見る":"次の問題へ").append("</button></form>");
+        }
+        out.append("</section><div class='below-card'><p>").append(s.review?"解き直しは時間を気にせず、じっくり。":attempt!=null?"解説を読み終えたら、次へ進もう。":"わからなくても大丈夫。答えたあとに確認しよう。").append("</p><span class='question-count-label'>正解 ").append(s.correct()).append(" 問</span></div>");
+        return out.toString();
+    }
+
+    static String results(Session s) {
+        int correct=s.correct(), total=s.answers.size(), missed=total-correct;
+        long seconds=Math.round(s.answers.stream().mapToDouble(Attempt::seconds).sum());
+        String elapsed=seconds>=60?seconds/60+"分"+seconds%60+"秒":seconds+"秒";
+        StringBuilder out = new StringBuilder("<div class='results'><section class='result-banner'><div><div class='eyebrow'>")
+            .append(s.review?"REVIEW COMPLETE":"CHALLENGE COMPLETE").append("</div><h1 class='result-title'>").append(missed==0?"全問正解、おみごと！":"おつかれさま！").append("</h1><p>").append(s.review?"解き直しの結果":"今回のチャレンジの結果").append("</p></div><div class='score'><strong>").append(correct).append("</strong><span>/ ").append(total).append(" 問正解</span></div></section><section class='result-content'><div class='result-top'><h2>教科ごとの正解数</h2><span>回答時間 ").append(elapsed).append("</span></div><div class='subject-results'>");
+        for (Subject sub:SUBJECTS) {
+            long all=s.answers.stream().filter(a->a.question.subject.equals(sub.id)).count();
+            long right=s.answers.stream().filter(a->a.question.subject.equals(sub.id)&&a.correct).count();
+            out.append("<div class='subject-result' style='--subject:").append(sub.color).append("'><div class='result-subject'>").append(sub.name).append("</div><div class='result-numbers'><strong>").append(all==0?"−":right).append("</strong><span>").append(all==0?"出題なし":"/ "+all).append("</span></div><div class='result-meter' aria-hidden='true'><div style='width:").append(all==0?0:right*100/all).append("%'></div></div></div>");
+        }
+        out.append("</div><div class='result-actions'>");
+        if (missed>0) out.append(form(s,"/review","")).append("<button class='primary' type='submit'>まちがえた").append(missed).append("問を解き直す</button></form>");
+        else out.append("<p>全部思い出せたね。次は、また別の問題に挑戦してみよう。</p>");
+        out.append("<div class='actions-row'>").append(form(s,"/start","")).append("<input type='hidden' name='count' value='").append(s.count).append("'><input type='hidden' name='seconds' value='").append(s.seconds).append("'><button class='secondary' type='submit'>新しい問題でチャレンジ</button></form>").append(form(s,"/quit","")).append("<button class='secondary' type='submit'>ホームに戻る</button></form></div></div>");
+        if (missed>0) {
+            out.append("<div class='review-section'><h2>もう一度、確かめよう</h2>");
+            for(Attempt a:s.answers) if(!a.correct) out.append("<details class='review-item'><summary><span class='review-icon' aria-hidden='true'>×</span><span>").append(h(a.question.text)).append("</span></summary><p>あなたの答え：").append(a.selected==null?"時間切れ":h(a.selected)).append("</p><p><strong>正解：").append(h(a.question.answer)).append("</strong></p><p>").append(h(a.question.explanation)).append("</p></details>");
+            out.append("</div>");
+        }
+        return out.append("<p class='result-note'>解き直しは時間制限なしです。ホームに戻ると、今回の結果は消えます。</p></section></div>").toString();
+    }
+
+    static String page(String title, String content) {
+        return "<!doctype html><html lang='ja'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#164b48'><title>"+h(title)+"</title><link rel='icon' href='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%23164b48%22/%3E%3Cpath d=%22M8 9h5l6 14h5M8 23h5l6-14h5%22 fill=%22none%22 stroke=%22%23e4ee91%22 stroke-width=%223%22/%3E%3C/svg%3E'><link rel='stylesheet' href='/style.css'><script src='/timer.js' defer></script></head><body><a class='skip' href='#main'>学習画面へ</a><header class='site-header'><a class='brand' href='/'><span class='brand-mark' aria-hidden='true'><svg viewBox='0 0 32 32'><path d='M7 9h6l6 14h6M7 23h6l6-14h6'/></svg></span><span>Study <strong>Shuffle</strong></span></a><span class='age-label'>小学5・6年生の復習</span></header><main id='main' tabindex='-1'>"+content+"</main><footer class='site-footer'><span>Study Shuffle</span><span>ひとつ答えて、ひとつ思い出す。</span></footer></body></html>";
+    }
+    static String hidden(Session s) { return "<input type='hidden' name='csrf' value='"+s.csrf+"'><input type='hidden' name='turn' value='"+s.turn+"'>"; }
+    static String form(Session s,String action,String cls) { return "<form method='post' action='"+action+"' class='"+cls+"'>"+hidden(s); }
+    static String radio(String name,int value,String label,int selected) { return "<label><input type='radio' name='"+name+"' value='"+value+"'"+(value==selected?" checked":"")+"><span>"+label+"</span></label>"; }
+    static Subject subject(String id) { return SUBJECTS.stream().filter(s->s.id.equals(id)).findFirst().orElseThrow(); }
+    static String h(String value) { return value.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\"","&quot;").replace("'","&#39;"); }
+    static String token() { byte[] bytes=new byte[24]; RANDOM.nextBytes(bytes); return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes); }
+
+    // ----- 出題・採点・タイマー・解き直しの自己チェック -----
+    static void check(boolean condition,String message) { if(!condition) throw new AssertionError(message); }
+    static void selfTest() {
+        check(QUESTIONS.size()==60,"問題数");
+        check(QUESTIONS.stream().map(Question::id).distinct().count()==60,"問題IDの重複");
+        for(Question q:QUESTIONS) check(q.choices.size()==4 && new HashSet<>(q.choices).size()==4 && q.choices.contains(q.answer),"4択・正解: "+q.id);
+        for(int trial=0;trial<100;trial++) {
+            Session s=new Session(); start(s,10,0);
+            for(Subject sub:SUBJECTS) check(s.deck.stream().filter(q->q.subject.equals(sub.id)).count()==2,"教科の配分");
+            for(int i=1;i<s.deck.size();i++) check(!s.deck.get(i-1).subject.equals(s.deck.get(i).subject),"教科の連続");
+            Set<String> old=new HashSet<>(s.previousIds);start(s,10,0);check(s.deck.stream().noneMatch(q->old.contains(q.id)),"直前の問題との重複");
+        }
+        Session s=new Session();start(s,5,0);
+        for(int i=0;i<5;i++) {
+            Question q=s.deck.get(i); int correct=q.choices.indexOf(q.answer);
+            answer(s,i==0?(correct+1)%4:correct,System.nanoTime());answer(s,correct,System.nanoTime());
+            check(s.answers.size()==i+1,"二重回答");next(s);
+        }
+        check(s.stage==Stage.RESULTS && s.correct()==4,"採点");review(s);
+        check(s.review && s.deck.size()==1 && !timed(s),"解き直し");
+        Question review=s.deck.get(0);answer(s,review.choices.indexOf(review.answer),s.started+TimeUnit.HOURS.toNanos(1));next(s);
+        check(s.correct()==1,"時間制限なし");start(s,5,30);Question q=s.deck.get(0);
+        answer(s,q.choices.indexOf(q.answer),s.deadline+1);check(!s.answers.get(0).correct && s.answers.get(0).selected==null,"時間切れ");
+        Session invalid=new Session();try {start(invalid,7,30);throw new AssertionError("不正設定");}catch(IllegalArgumentException expected){}
+        System.out.println("PASS: 全60問・5教科の配分・シャッフル・二重回答防止・採点・解き直し・制限時間");
+    }
+
+    // 時間の判定そのものはJava側。ブラウザのコードは表示と送信のみ。
+    static final String TIMER_JS = """
+        (() => {
+          const label = document.getElementById('seconds-left');
+          const form = document.getElementById('timeout-form');
+          if (!label || !form) return;
+          const end = performance.now() + Number(label.dataset.remaining);
+          const limit = Number(label.dataset.limit);
+          let sent = false;
+          function update() {
+            if (sent) return;
+            const left = Math.max(0, end - performance.now());
+            label.textContent = String(Math.ceil(left / 1000));
+            document.getElementById('time-fill').style.width = (left / limit * 100) + '%';
+            document.getElementById('timer').classList.toggle('urgent', left <= 10000);
+            document.getElementById('timer-bar').classList.toggle('urgent', left <= 10000);
+            if (left <= 0) { sent = true; form.requestSubmit(); }
+          }
+          // 通常回答とタイムアウトが同時に送られないようにする。
+          document.querySelectorAll('form').forEach(f => f.addEventListener('submit', () => { sent = true; }));
+          setInterval(update, 100);
+          document.addEventListener('visibilitychange', () => { if (!document.hidden) update(); });
+          window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
+          update();
+        })();
+        """;
+
+    static final String CSS = """
+@charset "UTF-8";
+:root{font-family:"Yu Gothic","游ゴシック",YuGothic,"Hiragino Kaku Gothic ProN",Meiryo,sans-serif;color:#203531;background:#f5f7f6;font-synthesis:none;line-height:1.7;--ink:#203531;--teal:#164b48;--muted:#63716c;--line:#dce3df;--lime:#e4ee91;--red:#a72c38;--green:#196044}
+*{box-sizing:border-box}body{margin:0}button,input,select{font:inherit}button{cursor:pointer}button,a,input,summary{touch-action:manipulation}button{line-height:1.4}button:disabled{cursor:default}a{color:inherit}button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible+span{outline:3px solid #397cda;outline-offset:4px}h1,h2,h3,p{margin:0}h1,h2,h3{line-height:1.45;letter-spacing:.02em}h1{font-size:2rem;font-weight:750}h2{font-size:1.3rem}p{overflow-wrap:anywhere}.site-header{max-width:1160px;margin:auto;padding:28px 32px;display:flex;align-items:center;justify-content:space-between;gap:20px}.brand{display:inline-flex;align-items:center;gap:11px;text-decoration:none;font-family:"Yu Gothic",sans-serif;font-size:1.3rem;letter-spacing:-.035em;font-weight:500}.brand strong{font-weight:800}.brand-mark{width:36px;height:36px;border-radius:10px;background:var(--teal);display:grid;place-items:center}.brand-mark svg{width:26px;height:26px;fill:none;stroke:var(--lime);stroke-width:2.6;stroke-linecap:round}.age-label{font-size:.875rem;color:var(--muted)}main{max-width:1000px;margin:36px auto 0;padding:0 32px;min-height:calc(100svh - 260px)}main:focus{outline:none}.eyebrow{font-size:.875rem;font-weight:700;letter-spacing:.12em;color:var(--teal);display:flex;align-items:center;gap:10px;margin-bottom:16px}.eyebrow:before{content:"";width:23px;height:2px;background:currentColor}.intro{margin-bottom:32px}.intro h1{font-size:clamp(1.8rem,4.5vw,2.7rem);letter-spacing:.025em}.intro p{color:var(--muted);margin-top:13px;font-size:1rem}.home-grid{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr);border:1px solid var(--line);border-radius:20px;overflow:hidden;background:white;box-shadow:0 9px 30px #18362b06}.subject-panel{background:var(--teal);color:white;padding:34px;display:flex;flex-direction:column}.small-label{font-size:.875rem;letter-spacing:.05em;font-weight:600}.subject-panel>.small-label{color:#d8e5df}.subject-list{list-style:none;padding:0;margin:20px 0 32px;display:grid;gap:0}.subject-list li{display:flex;align-items:center;gap:14px;padding:12px 0;border-bottom:1px solid #ffffff24;font-weight:600}.subject-list li:last-child{border-bottom:0}.subject-symbol{display:inline-grid;place-items:center;width:35px;height:35px;background:#ffffff12;border:1px solid #ffffff3b;border-radius:9px;font-size:1rem;color:var(--lime)}.subject-list .topic{margin-left:auto;font-size:.875rem;font-weight:400;color:#cfdfd6}.mix-note{margin-top:auto;font-size:.875rem;color:#d8e5df;border-left:2px solid var(--lime);padding-left:14px}.mix-note strong{color:#fff;font-weight:600}.setup{padding:34px;display:flex;flex-direction:column;gap:25px}.setup h2{font-size:1.25rem}fieldset{border:0;padding:0;margin:0;min-width:0}legend{font-size:.875rem;font-weight:700;padding:0;margin-bottom:10px}.segmented{display:flex;padding:4px;background:#f2f5f3;border:1px solid #e6ebe7;border-radius:12px;gap:4px}.segmented label{position:relative;flex:1;cursor:pointer}.segmented input{position:absolute;opacity:0;width:1px;height:1px}.segmented span{display:block;text-align:center;padding:10px 8px;border:1px solid transparent;border-radius:8px;font-size:1rem;color:var(--muted);white-space:nowrap}.segmented input:checked+span{background:white;color:var(--teal);border-color:#cad9cf;box-shadow:0 2px 4px #164b4808;font-weight:700}.hint{font-size:.8125rem;color:var(--muted);margin-top:8px}.start-area{margin-top:auto}.primary,.secondary,.text-button{border-radius:10px;padding:14px 20px;font-size:1rem;font-weight:700;border:1px solid transparent;min-height:50px;transition:background .15s,transform .15s}.primary{background:var(--teal);color:white}.primary:hover{background:#23615b}.primary:active,.secondary:active{transform:translateY(1px)}.start-button{background:var(--lime);color:#1d3c2a;width:100%;display:flex;align-items:center;justify-content:center;gap:11px}.start-button:hover{background:#d5e378}.start-button svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}.secondary{background:white;border-color:#cdd8d1;color:var(--teal)}.secondary:hover{background:#edf3ef}.text-button{padding:8px 10px;background:transparent;color:var(--muted);font-weight:500;min-height:42px}.text-button:hover{background:#eaf0ed;color:var(--teal)}.session-summary{text-align:center;font-size:.8125rem;color:var(--muted);margin-top:10px}.steps{display:flex;justify-content:center;gap:35px;margin:28px 0;color:var(--muted);font-size:.875rem}.steps div{display:flex;align-items:center;gap:8px}.steps span{display:grid;place-items:center;width:22px;height:22px;border:1px solid #d0dbd5;border-radius:50%;font-size:.75rem;color:var(--teal)}.how-to{border-top:1px solid var(--line);margin-top:22px;padding-top:18px;font-size:.875rem;color:var(--muted)}.how-to summary{cursor:pointer;width:fit-content;color:var(--teal);font-weight:600}.how-to p{margin-top:12px;max-width:720px}.question-count-label{font-variant-numeric:tabular-nums;color:var(--muted);font-size:.875rem}.play-header{display:flex;align-items:center;justify-content:space-between;margin:0 0 14px;gap:12px}.play-header h1{font-size:1.125rem}.progress-row{display:flex;align-items:center;gap:18px;margin-bottom:24px}.progress-track{height:5px;background:#dfe7e1;border-radius:4px;flex:1;overflow:hidden}.progress-fill{height:100%;background:var(--teal);transition:width .3s}.progress-dots{display:flex;gap:7px;flex:1;min-width:0}.progress-dot{height:6px;flex:1;background:#dce4de;border-radius:3px}.progress-dot.done{background:var(--teal)}.progress-dot.current{background:#a7be48}.question-card{background:#fff;border:1px solid var(--line);border-radius:20px;padding:32px 38px 30px;box-shadow:0 8px 35px #193b2c04}.question-topline{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:23px}.subject-tag{font-size:.875rem;display:inline-flex;align-items:center;gap:8px;font-weight:700;border:1px solid color-mix(in srgb,var(--subject),white 76%);background:color-mix(in srgb,var(--subject),white 95%);color:var(--subject);padding:5px 11px;border-radius:7px;white-space:nowrap}.subject-tag span{font-size:.75rem;opacity:.7;border-left:1px solid currentColor;padding-left:8px}.timer{font-size:.875rem;font-variant-numeric:tabular-nums;display:flex;align-items:center;gap:7px;color:var(--muted);white-space:nowrap}.timer svg{height:19px;width:19px;fill:none;stroke:currentColor;stroke-width:1.5}.timer strong{font-size:1.15rem;color:var(--ink)}.timer.urgent,.timer.urgent strong{color:var(--red)}.timer-bar{height:3px;background:#edf0ec;border-radius:3px;margin-top:-12px;margin-bottom:26px;overflow:hidden}.timer-bar div{height:100%;background:#9eb872;transition:width .2s linear}.timer-bar.urgent div{background:#c76b5f}.question-title{font-size:clamp(1.25rem,2.9vw,1.65rem);line-height:1.75;margin-bottom:26px;white-space:pre-line;overflow-wrap:anywhere}.question-title:focus,.feedback-title:focus,.result-title:focus{outline:none}.answers{display:grid;grid-template-columns:1fr 1fr;gap:12px}.answer{display:flex;align-items:center;gap:12px;min-height:82px;padding:17px 18px;text-align:left;border:1.5px solid #dce4de;border-radius:12px;background:white;color:var(--ink);font-size:1.05rem;transition:border-color .15s,background .15s;position:relative}.answer:not(:disabled):hover{border-color:#548776;background:#f4f8f4}.answer-letter{flex:0 0 27px;width:27px;height:27px;border-radius:6px;display:grid;place-items:center;background:#f0f4f1;color:#738177;font-size:.8125rem;font-weight:700}.answer-text{flex:1;overflow-wrap:anywhere}.answer-status{font-size:.75rem;white-space:nowrap;font-weight:700}.answer.correct{background:#edf7ef;border-color:#3e8661;color:#185b3d}.answer.correct .answer-letter{background:#c7e3d0;color:#185b3d}.answer.wrong{background:#fff0ef;border-color:#c66b6b;color:#9c2d36}.answer.wrong .answer-letter{background:#f2d4d2;color:#9c2d36}.answer.dim{color:#758079;background:#fafbfa;border-color:#e7ece8}.question-bottom{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:21px;color:var(--muted);font-size:.8125rem}.feedback{margin-top:22px;padding:22px 24px;background:#f1f6f2;border-radius:12px;border-left:3px solid #508b61;animation:appear .18s ease}.feedback.incorrect{background:#f8f4ed;border-color:#b88736}.feedback-title{font-size:1.2rem;color:#225e3c;margin-bottom:8px}.feedback.incorrect .feedback-title{color:#835416}.correct-answer{font-weight:700;margin-bottom:7px}.feedback p{font-size:1rem;line-height:1.9}.feedback-actions{margin-top:21px;display:flex;justify-content:flex-end}.feedback-actions button{min-width:200px}.below-card{display:flex;align-items:center;justify-content:space-between;margin-top:15px;gap:16px}.below-card p{font-size:.8125rem;color:var(--muted)}.results{max-width:810px;margin:auto}.result-banner{background:var(--teal);color:white;border-radius:18px;padding:30px 34px;display:flex;align-items:center;justify-content:space-between;gap:20px}.result-banner .eyebrow{color:var(--lime);margin-bottom:10px}.result-banner h1{font-size:1.65rem}.result-banner p{color:#d4e5dc;font-size:.875rem;margin-top:7px}.score{white-space:nowrap;display:flex;align-items:baseline;gap:7px;font-variant-numeric:tabular-nums}.score strong{font-size:4rem;line-height:1;font-weight:700;letter-spacing:-.05em}.score span{font-size:1rem;color:#d4e5dc}.result-content{background:white;border:1px solid var(--line);border-radius:18px;margin-top:18px;padding:27px 32px}.result-top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:20px}.result-top h2{font-size:1.05rem}.result-top span{font-size:.8125rem;color:var(--muted)}.subject-results{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}.subject-result .result-subject{font-size:.875rem;color:var(--subject);font-weight:700}.subject-result .result-numbers{margin:7px 0;display:flex;gap:4px;align-items:baseline;font-variant-numeric:tabular-nums}.result-numbers strong{font-size:1.6rem}.result-numbers span{font-size:.875rem;color:var(--muted)}.result-meter{height:4px;background:#e7ece9;border-radius:3px;overflow:hidden}.result-meter div{height:100%;background:var(--subject)}.result-actions{display:grid;gap:11px;margin-top:24px}.result-actions .primary{width:100%}.actions-row{display:flex;gap:12px}.actions-row button{flex:1}.review-section{margin-top:27px}.review-section h2{font-size:1.1rem;margin-bottom:10px}.review-item{border-bottom:1px solid var(--line);padding:15px 0}.review-item summary{display:flex;align-items:center;gap:12px;cursor:pointer;font-size:.9375rem;list-style:none}.review-item summary::-webkit-details-marker{display:none}.review-item summary:after{content:"＋";margin-left:auto;color:var(--muted)}.review-item[open] summary:after{content:"−"}.review-icon{color:var(--red);font-size:1.2rem}.review-item p{font-size:.9375rem;margin-top:10px;color:var(--muted)}.review-item p strong{color:var(--ink)}.result-note{font-size:.8125rem;color:var(--muted);margin-top:19px}.site-footer{max-width:1160px;display:flex;justify-content:space-between;margin:50px auto 0;padding:23px 32px 28px;color:#758278;font-size:.75rem;gap:20px}.site-footer>span:first-child{font-weight:600;letter-spacing:.04em}.sr-only{position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}.skip{position:absolute;left:16px;top:-80px;background:white;padding:12px;z-index:10}.skip:focus{top:12px}dialog{max-width:460px;width:calc(100% - 36px);border:1px solid var(--line);border-radius:18px;padding:28px;color:var(--ink);box-shadow:0 20px 80px #10271c33}dialog::backdrop{background:#10292077}dialog p{margin-top:12px;color:var(--muted)}.dialog-actions{display:flex;gap:12px;margin-top:25px}.dialog-actions button{flex:1}.noscript{padding:30px;text-align:center}@keyframes appear{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+@media(min-width:1000px){main:has(.question-card){max-width:880px}}
+@media(max-width:700px){.site-header{padding:20px 22px}.brand{font-size:1.15rem}.brand-mark{width:32px;height:32px}.age-label{font-size:.75rem}main{margin-top:24px;padding:0 20px;min-height:calc(100svh - 218px)}.intro{margin-bottom:23px}.intro p{font-size:.9375rem;line-height:1.9}.home-grid{grid-template-columns:1fr}.subject-panel{padding:22px 24px}.subject-panel>.small-label,.subject-list .topic,.mix-note{display:none}.subject-list{display:flex;justify-content:space-between;margin:0;gap:12px}.subject-list li{padding:0;border:0;display:flex;flex-direction:column;gap:7px;font-size:.8125rem}.subject-symbol{width:34px;height:34px}.setup{padding:25px;gap:22px}.setup h2{font-size:1.15rem}.steps{gap:18px;font-size:.8125rem;margin:24px 0}.steps div{gap:6px}.steps span{width:20px;height:20px;flex-shrink:0}.how-to{margin-top:18px}.site-footer{padding:20px 22px;margin-top:30px;font-size:.75rem}.question-card{padding:23px 22px;border-radius:16px}.question-topline{margin-bottom:20px;gap:10px}.question-title{font-size:1.25rem;line-height:1.8;margin-bottom:22px}.answers{grid-template-columns:1fr;gap:10px}.answer{min-height:61px;font-size:1rem;padding:12px 14px}.progress-row{margin-bottom:18px;gap:12px}.keyboard-hint{display:none}.question-bottom{margin-top:17px}.feedback{padding:17px 18px;margin-top:20px}.feedback p{font-size:.9375rem}.feedback-actions{margin-top:18px}.feedback-actions button{width:100%}.below-card p{max-width:70%}.result-banner{padding:26px 24px;align-items:flex-start}.result-banner h1{font-size:1.35rem}.score strong{font-size:3rem}.score{gap:4px}.result-content{padding:23px}.subject-results{gap:11px}.subject-result .result-subject{font-size:.8125rem}.result-numbers strong{font-size:1.35rem}.result-numbers span{font-size:.75rem}.result-top{align-items:flex-start}.result-top span{font-size:.75rem}.actions-row{flex-direction:column;gap:10px}.result-title{max-width:210px}.review-item summary{font-size:.875rem}.review-section{margin-top:22px}}
+@media(max-width:370px){main{padding:0 15px}.site-header{padding:18px 15px;gap:10px}.age-label{font-size:.75rem}.brand{font-size:1rem}.question-card,.setup{padding:20px 18px}.steps{gap:10px}.steps div{gap:4px}.subject-tag span{display:none}.result-banner{flex-direction:column}.subject-results{gap:7px}.site-footer{padding:20px 15px;gap:10px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+
+form{margin:0}.actions-row form{flex:1}.actions-row form button{width:100%}.inline-form{display:inline}.answer-form{display:block}
+        """;
+
+    // 問題を増やす場合は、このリストに同じ形式で追記する。
+    static Question q(String id,String subject,String topic,String text,String answer,String b,String c,String d,String explanation) {
+        return new Question(id,subject,topic,text,answer,List.of(answer,b,c,d),explanation);
+    }
+    static final List<Question> QUESTIONS = List.of(
+        q("q1", "japanese", "漢字の読み", "「豊富」の読み方は？", "ほうふ", "とよふ", "ほうぶ", "ゆうふ", "「豊富（ほうふ）」は、たくさんあって、十分にあること。「知識が豊富」のように使います。"),
+        q("q2", "japanese", "漢字の読み", "「承知」の読み方は？", "しょうち", "じょうち", "しょうし", "うけち", "「承知（しょうち）」は、事情を知っていることや、申し出を聞き入れることです。"),
+        q("q3", "japanese", "言葉の意味", "「努力」と近い意味の言葉は？", "一生けんめい取り組むこと", "何もせず待つこと", "人に任せること", "すぐにあきらめること", "目標に向かって一生けんめい取り組むことを「努力」といいます。"),
+        q("q4", "japanese", "反対の意味", "「賛成」と反対の意味の言葉は？", "反対", "同意", "協力", "参加", "ある意見をよいと思うのが「賛成」。その意見に同意しないのが「反対」です。"),
+        q("q5", "japanese", "ことわざ", "「石の上にも三年」が伝えていることは？", "しんぼう強く続けることが大切", "石は3年でこわれる", "3年たったら必ずやめる", "石の上で休むとよい", "つらくてもがまんして続ければ、成果につながるというたとえです。実際に石に座る話ではありません。"),
+        q("q6", "japanese", "ことわざ", "「急がば回れ」の意味は？", "急ぐときほど確実な方法を選ぶ", "いつでも遠回りする", "何も考えずに急ぐ", "同じ場所を何度も回る", "あぶない近道より、安全で確実な道のほうが、結局は早く着くというたとえです。"),
+        q("q7", "japanese", "文の組み立て", "「妹が公園で遊ぶ。」の主語は？", "妹が", "公園で", "遊ぶ", "公園", "主語は「だれが」「何が」に当たる部分。「だれが遊ぶ？」と考えると「妹が」です。"),
+        q("q8", "japanese", "文の組み立て", "「青い鳥が飛んでいる。」の述語は？", "飛んでいる", "青い", "鳥が", "青い鳥", "述語は「どうする」「どんなだ」「何だ」に当たる部分。この文では「飛んでいる」です。"),
+        q("q9", "japanese", "敬語", "「見る」の尊敬語は？", "ご覧になる", "拝見する", "見ておく", "見つめる", "相手の動作を高める言い方が「ご覧になる」です。「拝見する」は自分の動作をへりくだる言い方です。"),
+        q("q10", "japanese", "四字熟語", "「一石二鳥」の意味は？", "一つのことから二つのよい結果を得る", "二つのことを一度に失う", "鳥を一羽ずつ数える", "一つのことだけを続ける", "一つの行動で二つの利益を得ることです。「歩いて通学すると、移動にも運動にもなる」などが例です。"),
+        q("q11", "japanese", "慣用句", "「胸を張る」は、どんな気持ちを表す？", "自信や誇りがある", "とても悲しい", "こわくて動けない", "退屈している", "自信をもって堂々とすることを「胸を張る」といいます。"),
+        q("q12", "japanese", "接続語", "「雨が降った。（　）、試合は中止になった。」に合う言葉は？", "そのため", "しかし", "それでも", "ところが", "雨が降ったことが原因で、試合が中止になっています。原因と結果をつなぐ「そのため」が合います。"),
+        q("q13", "math", "分数", "1/2 ＋ 1/3 は？", "5/6", "2/5", "1/5", "2/6", "分母を6にそろえると、3/6 ＋ 2/6 ＝ 5/6 です。分母どうしは足しません。"),
+        q("q14", "math", "小数", "0.4 × 0.3 は？", "0.12", "1.2", "0.7", "0.012", "4 × 3 ＝ 12。小数点以下のけたは、合わせて2けたなので0.12になります。"),
+        q("q15", "math", "割合", "200円の30％は何円？", "60円", "30円", "170円", "600円", "30％は0.3です。200 × 0.3 ＝ 60なので、60円です。"),
+        q("q16", "math", "三角形の面積", "底辺8cm、高さ5cmの三角形の面積は？", "20cm²", "40cm²", "13cm²", "26cm²", "三角形の面積は「底辺 × 高さ ÷ 2」。8 × 5 ÷ 2 ＝ 20cm²です。"),
+        q("q17", "math", "円の面積", "半径3cmの円の面積は？（円周率は3.14）", "28.26cm²", "9.42cm²", "18.84cm²", "113.04cm²", "円の面積は「半径 × 半径 × 円周率」。3 × 3 × 3.14 ＝ 28.26cm²です。"),
+        q("q18", "math", "速さ", "120kmの道のりを2時間で進みました。平均の時速は？", "時速60km", "時速240km", "時速120km", "時速30km", "速さは「道のり ÷ 時間」。120 ÷ 2 ＝ 60なので、時速60kmです。"),
+        q("q19", "math", "平均", "3回のテストが70点、80点、90点でした。平均点は？", "80点", "75点", "85点", "240点", "合計は70 ＋ 80 ＋ 90 ＝ 240点。3回で割ると、240 ÷ 3 ＝ 80点です。"),
+        q("q20", "math", "体積", "たて3cm、横4cm、高さ5cmの直方体の体積は？", "60cm³", "12cm³", "20cm³", "47cm³", "直方体の体積は「たて × 横 × 高さ」。3 × 4 × 5 ＝ 60cm³です。"),
+        q("q21", "math", "比", "赤と青の玉の数の比は2：3です。全部で25個なら、赤は何個？", "10個", "15個", "5個", "20個", "比の合計は2 ＋ 3 ＝ 5。25 ÷ 5 ＝ 5なので、赤は5 × 2 ＝ 10個です。"),
+        q("q22", "math", "約分", "6/8 を約分すると？", "3/4", "2/3", "6/4", "1/4", "分子と分母を、共通の約数2で割ります。6 ÷ 2 ＝ 3、8 ÷ 2 ＝ 4なので3/4です。"),
+        q("q23", "math", "角度", "三角形の二つの角は50°と60°です。残りの角は？", "70°", "110°", "80°", "90°", "三角形の三つの角の和は180°です。180 − 50 − 60 ＝ 70°になります。"),
+        q("q24", "math", "倍数", "4と6の最小公倍数は？", "12", "2", "10", "24", "4の倍数は4、8、12…。6の倍数は6、12…。最初に共通する数は12です。"),
+        q("q25", "science", "植物", "植物が日光を受けて、葉でつくる養分は？", "でんぷん", "食塩", "砂糖水", "鉄", "植物は日光を受け、葉ででんぷんなどの養分をつくります。葉のでんぷんはヨウ素液で調べられます。"),
+        q("q26", "science", "実験", "でんぷんにヨウ素液をつけると、何色になる？", "青むらさき色", "赤色", "緑色", "無色", "でんぷんがあるところにヨウ素液をつけると、青むらさき色になります。"),
+        q("q27", "science", "人の体", "食べ物の養分を主に吸収する器官は？", "小腸", "心臓", "肺", "食道", "消化された食べ物の養分は、主に小腸で吸収されます。"),
+        q("q28", "science", "人の体", "血液を全身に送り出す器官は？", "心臓", "胃", "肺", "小腸", "心臓は縮んだり広がったりして、ポンプのように血液を送り出します。"),
+        q("q29", "science", "ものの燃え方", "ものが燃えるのを助ける気体は？", "酸素", "二酸化炭素", "窒素", "水蒸気", "酸素には、ものが燃えるのを助けるはたらきがあります。酸素そのものが燃えるという意味ではありません。"),
+        q("q30", "science", "水溶液", "食塩を水に完全にとかすと、食塩はどうなる？", "見えなくなるが、水の中にある", "なくなってしまう", "すべて気体になる", "別の物質になる", "見えなくなっても、食塩は水の中にあります。水を蒸発させると食塩を取り出せます。"),
+        q("q31", "science", "水の変化", "水が水蒸気になる変化を何という？", "蒸発", "凝固", "溶解", "発芽", "水などの液体が気体になる変化を蒸発といいます。水は沸騰していないときも、表面から蒸発します。"),
+        q("q32", "science", "流れる水", "流れる水の三つのはたらきに含まれないものは？", "水をこおらせる", "土地をけずる", "土や石を運ぶ", "土や石を積もらせる", "流れる水には、土地をけずる「侵食」、運ぶ「運搬」、積もらせる「堆積」のはたらきがあります。"),
+        q("q33", "science", "月", "月が明るく見えるのはなぜ？", "太陽の光を反射しているから", "月自体が燃えているから", "地球の熱をためているから", "雲が光を出すから", "月は自分では光を出しません。太陽の光を反射している部分が明るく見えます。"),
+        q("q34", "science", "ふりこ", "ふりこの往復する時間を長くするには？", "ふりこを長くする", "おもりを重くする", "おもりの色を変える", "ふりこを短くする", "小さく振らせるとき、ふりこの往復する時間は長さで変わります。長くすると、1往復にかかる時間も長くなります。"),
+        q("q35", "science", "電磁石", "電磁石の力を強くする方法は？", "コイルに流れる電流を大きくする", "電流を止める", "鉄しんを紙にかえる", "同じ電流でコイルの巻き数を減らす", "同じコイルなら、流れる電流を大きくすると電磁石の力は強くなります。実験では決められた器具と方法を守りましょう。"),
+        q("q36", "science", "発芽", "インゲンマメの発芽に必要な条件の組み合わせは？", "水・空気・適当な温度", "水・肥料・光", "土・肥料・光", "空気・肥料・光", "インゲンマメの発芽には、水・空気・適当な温度が必要です。発芽するときは、種子の中の養分を使います。"),
+        q("q37", "social", "日本の地理", "日本の都道府県の数は？", "47", "43", "45", "50", "日本には1都・1道・2府・43県があり、合わせて47都道府県です。"),
+        q("q38", "social", "日本の地理", "日本の四つの大きな島のうち、最も北にあるのは？", "北海道", "本州", "四国", "九州", "四つの大きな島は、北海道・本州・四国・九州です。その中で最も北にあるのが北海道です。"),
+        q("q39", "social", "日本の地理", "日本で最も高い山は？", "富士山", "筑波山", "阿蘇山", "高尾山", "富士山の高さは3,776m。静岡県と山梨県にまたがっています。"),
+        q("q40", "social", "農業", "稲作で、田に苗を植える作業は？", "田植え", "稲刈り", "脱穀", "精米", "育てた稲の苗を田に植える作業が田植えです。稲刈りは育った稲を刈り取る作業です。"),
+        q("q41", "social", "貿易", "外国から品物を買って、国内に入れることは？", "輸入", "輸出", "生産", "消費", "外国から品物を買って国内に入れることが輸入、外国に品物を売ることが輸出です。"),
+        q("q42", "social", "地図", "地図で、実際の距離を縮めた割合を何という？", "縮尺", "方位", "標高", "面積", "縮尺は、地図上の長さと実際の長さの比です。たとえば5万分の1なら、地図の1cmは実際の500mです。"),
+        q("q43", "social", "歴史", "江戸幕府を開いた人物は？", "徳川家康", "豊臣秀吉", "織田信長", "聖徳太子", "徳川家康は1603年に征夷大将軍となり、江戸に幕府を開きました。"),
+        q("q44", "social", "歴史", "縄文時代の人々が使った、縄目の模様が特徴の土器は？", "縄文土器", "弥生土器", "埴輪", "青銅器", "縄を押しつけたような模様のある土器が、縄文土器と呼ばれています。"),
+        q("q45", "social", "歴史", "奈良の東大寺に大仏をつくることを進めた天皇は？", "聖武天皇", "天智天皇", "桓武天皇", "明治天皇", "聖武天皇は、仏教の力で国を安定させようとし、大仏づくりを進めました。"),
+        q("q46", "social", "政治", "国の法律をつくる機関は？", "国会", "裁判所", "気象庁", "消防署", "国会は、法律をつくったり、国の予算を決めたりします。"),
+        q("q47", "social", "日本国憲法", "日本国憲法の三つの基本原則に含まれるものは？", "平和主義", "身分制度", "鎖国", "参勤交代", "日本国憲法の三つの基本原則は、国民主権・基本的人権の尊重・平和主義です。"),
+        q("q48", "social", "くらしと環境", "使い終わったものを資源として再び利用することは？", "リサイクル", "輸入", "開墾", "干拓", "リサイクルは、使い終わったものを資源として再び利用することです。古紙から紙をつくることなどが例です。"),
+        q("q49", "english", "あいさつ", "朝のあいさつはどれ？", "Good morning.", "Good night.", "Goodbye.", "Thank you.", "Good morning. は「おはようございます」。Good night. は「おやすみなさい」です。"),
+        q("q50", "english", "曜日", "「水曜日」を表す英語は？", "Wednesday", "Monday", "Friday", "Sunday", "Wednesday は水曜日。Monday は月曜日、Friday は金曜日、Sunday は日曜日です。"),
+        q("q51", "english", "月", "「8月」を表す英語は？", "August", "April", "October", "December", "August は8月。April は4月、October は10月、December は12月です。"),
+        q("q52", "english", "好きなもの", "「私はりんごが好きです」に合う文は？", "I like apples.", "I am an apple.", "I can swim.", "I have a pen.", "I like ～. で「私は～が好きです」。りんご全般が好きなときは apples といいます。"),
+        q("q53", "english", "できること", "「私は泳げます」に合う文は？", "I can swim.", "I like summer.", "I am eleven.", "I have a dog.", "I can ～. で「私は～できます」。swim は「泳ぐ」という意味です。"),
+        q("q54", "english", "たずね方", "相手の名前をたずねる文は？", "What is your name?", "How are you?", "What time is it?", "Where is the park?", "What is your name? は「あなたの名前は何ですか」。My name is ～. などで答えます。"),
+        q("q55", "english", "数", "「40」を表す英語は？", "forty", "fourteen", "four", "fifty", "forty は40、fourteen は14、four は4、fifty は50です。"),
+        q("q56", "english", "身近な場所", "「図書館」を表す英語は？", "library", "hospital", "station", "kitchen", "library は図書館。hospital は病院、station は駅、kitchen は台所です。"),
+        q("q57", "english", "位置", "The cat is under the desk. 猫はどこにいる？", "机の下", "机の上", "机の中", "机の後ろ", "under は「～の下に」。under the desk で「机の下に」という意味です。"),
+        q("q58", "english", "時こく", "It is seven thirty. 何時？", "7時30分", "7時13分", "3時7分", "7時3分", "seven は7、thirty は30。seven thirty で7時30分です。"),
+        q("q59", "english", "気持ち", "「おなかがすいた」に合う文は？", "I am hungry.", "I am happy.", "I am tired.", "I am sleepy.", "hungry は「空腹の」。happy は「うれしい」、tired は「疲れた」、sleepy は「眠い」です。"),
+        q("q60", "english", "返事", "Thank you. と言われたときの返事は？", "You're welcome.", "Good morning.", "See you.", "I am ten.", "You're welcome. は「どういたしまして」。お礼を言われたときに使う返事です。")
+    );
+}
